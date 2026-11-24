@@ -968,10 +968,13 @@ class FastMovie
             $difference = HV_JP2_DIR . $before['filepath'] . '/' . $before['filename'];
         }
 
+        $wcsHeader = new \Image_JPEG2000_JP2ImageXMLBox($jp2['path']);
+
         $recipe = $this->layerRecipe($layer['uiLabels'], $image['date']);
+        $recipe['wcs'] = $wcsHeader->hasUsableWCS();
 
         if ($recipe['wcs']) {
-            $decoded = $this->decodeWcsLayer($jp2, (int) $layer['opacity'], $difference);
+            $decoded = $this->decodeWcsLayer($jp2, $wcsHeader, $recipe, (int) $layer['opacity'], $difference);
         } else {
             $decoded = $this->decodeLayer($jp2, $recipe, $offsetX, $offsetY,
                 $this->followViewport ? $originalOffsetX : $offsetX,
@@ -1108,10 +1111,8 @@ class FastMovie
                 break;
             case 'SPICE':
                 // Grayscale rasters with rectangular, rotated pixels: placed
-                // through the PC matrix, added onto the layers below like the
-                // interactive SPICE layer (Image_ImageType_SPICEImage).
-                $recipe['wcs']       = true;
-                $recipe['composite'] = Imagick::COMPOSITE_PLUS;
+                // through the PC matrix when the header provides one (see
+                // buildLayer()'s hasUsableWCS() probe).
                 break;
             default:
                 throw new Exception('No image type for layer ' . join('/', $names), 30);
@@ -1220,11 +1221,10 @@ class FastMovie
      *
      * The whole raster is decoded, not a sub-region: a rotated raster can
      * cross the viewport even when its unrotated rectangle does not. No
-     * colour table, no occulter mask.
+     * occulter mask.
      */
-    private function decodeWcsLayer(array $jp2, int $opacity, ?string $difference): Imagick
+    private function decodeWcsLayer(array $jp2, \Image_JPEG2000_JP2ImageXMLBox $header, array $recipe, int $opacity, ?string $difference): Imagick
     {
-        $header = new \Image_JPEG2000_JP2ImageXMLBox($jp2['path']);
         $cd     = $header->getCDMatrix();
         $sun    = $header->getRefPixelCoords();   // CRPIX - inverse(CD) * CRVAL
 
@@ -1250,8 +1250,16 @@ class FastMovie
         $this->extractRegion($jp2, $input, $region, 0);
 
         $image = new Imagick($input);
+
+        $applyColorTable = true;
         if ($difference !== null) {
             $image = $this->subtractDifferenceImage($image, $jp2, $difference, $region, 0, '.pgm');
+            $applyColorTable = false;
+        }
+
+        // The brightness correction, if there is one, is folded into the table.
+        if ($recipe['colorTable'] && $applyColorTable) {
+            $image->clutImage(self::colorTableFor($recipe['colorTable'], $recipe['brightness']));
         }
 
         // Grayscale pixels must take RGB layers below without pulling their

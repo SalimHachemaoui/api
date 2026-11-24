@@ -230,6 +230,82 @@ class Helper_RegionOfInterest
     }
     
     /**
+     * Returns the native-JP2 pixel bounding box that must be decoded to
+     * cover this region of interest when rendered through an affine
+     * (WCS rotation/shear) transform, instead of the scalar crop/scale path.
+     *
+     * The output viewport corners are mapped back into native JP2 pixel
+     * space by inverting the 2x2 affine, and the bounding box of those
+     * mapped corners is used (exact, since the affine image of a rectangle
+     * is a parallelogram whose bounding box is exactly the bbox of its
+     * corners). A constant padding is added to absorb interpolation-kernel
+     * edge effects, and the result is clamped to the JP2 dimensions.
+     *
+     * @param int   $jp2Width  Native JP2 image width in pixels
+     * @param int   $jp2Height Native JP2 image height in pixels
+     * @param float $a         Affine matrix element
+     * @param float $b         Affine matrix element
+     * @param float $c         Affine matrix element
+     * @param float $d         Affine matrix element
+     * @param float $tx        Affine x translation
+     * @param float $ty        Affine y translation
+     * @param int   $padPixels Padding (in native pixels) to add on all sides
+     *
+     * @return array top/left/bottom/right, same shape as getImageSubRegion()
+     */
+    public function getImageSubRegionForAffine($jp2Width, $jp2Height, $a, $b, $c, $d, $tx, $ty, $padPixels = 4)
+    {
+        $determinant = ($a * $d) - ($b * $c);
+        if (!is_finite($determinant) || abs($determinant) < 1.0e-15) {
+            throw new Exception('The affine matrix is singular.', 21);
+        }
+
+        $width  = round($this->getPixelWidth());
+        $height = round($this->getPixelHeight());
+
+        $corners = array(
+            array(0, 0),
+            array($width, 0),
+            array(0, $height),
+            array($width, $height)
+        );
+
+        $xs = array();
+        $ys = array();
+        foreach ($corners as $corner) {
+            $ox = $corner[0] - $tx;
+            $oy = $corner[1] - $ty;
+
+            $ix = ($d * $ox - $c * $oy) / $determinant;
+            $iy = (-$b * $ox + $a * $oy) / $determinant;
+
+            $xs[] = $ix;
+            $ys[] = $iy;
+        }
+
+        $left   = min($xs) - $padPixels;
+        $right  = max($xs) + $padPixels;
+        $top    = min($ys) - $padPixels;
+        $bottom = max($ys) + $padPixels;
+
+        $left   = max(0, min($jp2Width,  $left));
+        $right  = max(0, min($jp2Width,  $right));
+        $top    = max(0, min($jp2Height, $top));
+        $bottom = max(0, min($jp2Height, $bottom));
+
+        if (($right - $left == 0) || ($bottom - $top == 0)) {
+            throw new Exception(INVALID_REGION_OF_INTEREST, 21);
+        }
+
+        return array(
+            'top'    => $top,
+            'left'   => $left,
+            'bottom' => $bottom,
+            'right'  => $right
+        );
+    }
+
+    /**
      * Returns a polygon string representation of the region of interest of the form POLYGON((0 0, 0 1, 1 1, 1 0, 0 0))
      * where each item between commas is an x & y coordinate for one of the corners of the roi.
      *

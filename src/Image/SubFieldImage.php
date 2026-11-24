@@ -50,6 +50,7 @@ class Image_SubFieldImage {
     protected $imageOptions;
     protected $reduce;
     protected $padding;
+    protected $affine;
 
     /**
      * Creates an Image_SubFieldImage instance
@@ -99,9 +100,6 @@ class Image_SubFieldImage {
         $jp2Height = $jp2->getHeight();
         $jp2Scale  = $jp2->getScale();
 
-        // Convert region of interest from arc-seconds to pixels
-        $this->imageSubRegion = $roi->getImageSubRegion($jp2Width, $jp2Height, $jp2Scale, $offsetX, $offsetY);
-
         // Desired image scale (normalized to 1au)
         $this->desiredScale    = $roi->imageScale();
 
@@ -110,6 +108,57 @@ class Image_SubFieldImage {
 		// Make sure result >= 0 with max.
 		// Make sure result <= maxReduction with min.
         $this->reduce          = min(max(0, floor($this->scaleFactor)), $jp2->getMaxReduction());
+
+        $this->affine = null;
+        $wcsHeader = $this->shouldUseWcsAffine($this->imageOptions, $jp2);
+
+        if ($wcsHeader !== null) {
+            $cd = $wcsHeader->getCDMatrix();
+            $sun = $wcsHeader->getRefPixelCoords();
+
+            // Use the same 1 AU normalization as the tile metadata. The
+            // stored scalar scale is |CDELT1| * DSUN/AU, not a second WCS
+            // transform.
+            $factor = $jp2Scale / $wcsHeader->getImagePlateScale() / $roi->imageScale();
+            $a = $cd[0][0] * $factor;
+            $b = -$cd[1][0] * $factor;
+            $c = -$cd[0][1] * $factor;
+            $d = $cd[1][1] * $factor;
+            $shift = $this->imageOptions['wcsViewportOffset'] ?? array(0, 0);
+
+            // The canonical tile grid uses refPixelX and height-refPixelY.
+            // Conjugating CD by the Y flip converts FITS Y-up to raster
+            // Y-down. Keep this origin convention identical to the
+            // interactive tile grid; neither CROTA nor another rotation is
+            // applied after this affine.
+            $tx = -$a * $sun[0] - $c * ($jp2Height - $sun[1])
+                - $roi->left() / $roi->imageScale() - $shift[0];
+            $ty = -$b * $sun[0] - $d * ($jp2Height - $sun[1])
+                - $roi->top() / $roi->imageScale() - $shift[1];
+
+            // Bounding box is computed with the crop-origin-0 affine, then
+            // the affine is adjusted below for the chosen crop origin and
+            // reduce level.
+            $this->imageSubRegion = $roi->getImageSubRegionForAffine(
+                $jp2Width, $jp2Height, $a, $b, $c, $d, $tx, $ty
+            );
+
+            $cropLeft = $this->imageSubRegion['left'];
+            $cropTop  = $this->imageSubRegion['top'];
+            $scale    = pow(2, $this->reduce);
+
+            $this->affine = array(
+                $a * $scale,
+                $b * $scale,
+                $c * $scale,
+                $d * $scale,
+                $a * $cropLeft + $c * $cropTop + $tx,
+                $b * $cropLeft + $d * $cropTop + $ty
+            );
+        } else {
+            // Convert region of interest from arc-seconds to pixels
+            $this->imageSubRegion = $roi->getImageSubRegion($jp2Width, $jp2Height, $jp2Scale, $offsetX, $offsetY);
+        }
 
         $this->subfieldWidth   = $this->imageSubRegion['right'] - $this->imageSubRegion['left'];
         $this->subfieldHeight  = $this->imageSubRegion['bottom'] - $this->imageSubRegion['top'];
@@ -125,6 +174,45 @@ class Image_SubFieldImage {
         $this->originalOffsetX = $this->imageOptions['originalOffsetX'];
         $this->originalOffsetY = $this->imageOptions['originalOffsetY'];
         $this->followViewport  = $this->imageOptions['followViewport'];
+    }
+
+    /**
+     * Determines whether this image should be rendered through the
+     * WCS-affine (PC/CD matrix) path instead of the scalar crop/scale path.
+     *
+     * Only screenshot/movie-frame composites set 'compositeWCS', so tiles
+     * are never affected. The JP2 header must also carry usable WCS data.
+     *
+     * @param array $options Image options
+     * @param Object $jp2    JP2 image object
+     *
+     * @return Image_JPEG2000_JP2ImageXMLBox|null The parsed header if the
+     *         affine path should be used, otherwise null
+     */
+    protected function shouldUseWcsAffine($options, $jp2) {
+        if (empty($options['compositeWCS'])) {
+            return null;
+        }
+
+        require_once HV_ROOT_DIR.'/../src/Image/JPEG2000/JP2ImageXMLBox.php';
+        $header = new Image_JPEG2000_JP2ImageXMLBox($jp2->getFilePath());
+
+        if (!$header->hasUsableWCS()) {
+            return null;
+        }
+
+        return $header;
+    }
+
+    /**
+     * Hook for subclasses to adjust the colorspace of the raw extracted
+     * raster right after it is loaded. Default is a no-op.
+     *
+     * @param Object &$imagickImage An initialized Imagick object
+     *
+     * @return void
+     */
+    protected function prepareColorspace(&$imagickImage) {
     }
 
     /**
@@ -266,6 +354,7 @@ class Image_SubFieldImage {
 
                 // Convert to GD-readable format
                 $grayscale = new IMagick($input);
+                $this->prepareColorspace($grayscale);
 
 				$applyColorTable = true;
 				if(isset($this->imageOptions['jp2Difference']) && $this->imageOptions['jp2Difference'] instanceof Image_JPEG2000_JP2Image){
@@ -310,6 +399,7 @@ class Image_SubFieldImage {
             }
             else {
                 $coloredImage = new IMagick($input);
+                $this->prepareColorspace($coloredImage);
                 if(isset($this->imageOptions['jp2Difference']) && $this->imageOptions['jp2Difference'] instanceof Image_JPEG2000_JP2Image){
 					$inputDiff = substr($this->imageOptions['jp2DiffPath'], 0, -4).rand().$extension;
 					$this->imageOptions['jp2Difference']->extractRegion($inputDiff, $this->imageSubRegion, $this->reduce);
@@ -330,41 +420,51 @@ class Image_SubFieldImage {
             // Apply compression and interlacing
             $this->compressImage($coloredImage);
 
-            // Resize extracted image to correct size before padding.
-            $rescaleBlurFactor = 0.6;
+            if ($this->affine !== null) {
+                $coloredImage->setImageVirtualPixelMethod(Imagick::VIRTUALPIXELMETHOD_TRANSPARENT);
+                $coloredImage->setImageBackgroundColor('transparent');
+                $coloredImage->setImagePage(0, 0, 0, 0);
+                $coloredImage->setImageArtifact('distort:viewport', sprintf('%dx%d+0+0',
+                    round($this->roi->getPixelWidth()), round($this->roi->getPixelHeight())));
+                $coloredImage->distortImage(Imagick::DISTORTION_AFFINEPROJECTION, $this->affine, false);
+                $coloredImage->setImagePage(0, 0, 0, 0);
+            } else {
+                // Resize extracted image to correct size before padding.
+                $rescaleBlurFactor = 0.6;
 
-			if($this->imageOptions['movie']){
-				$coloredImage->scaleImage(round($this->subfieldRelWidth), round($this->subfieldRelHeight));
-				$coloredImage->setImageBackgroundColor('transparent');
-			}else{
-				$coloredImage->resizeImage(
-                	round($this->subfieldRelWidth),
-                	round($this->subfieldRelHeight),
-                	$this->imageOptions['rescale'],
-                	$rescaleBlurFactor
-				);
-	            $coloredImage->setImageBackgroundColor('transparent');
-			}
+                if($this->imageOptions['movie']){
+                    $coloredImage->scaleImage(round($this->subfieldRelWidth), round($this->subfieldRelHeight));
+                    $coloredImage->setImageBackgroundColor('transparent');
+                }else{
+                    $coloredImage->resizeImage(
+                        round($this->subfieldRelWidth),
+                        round($this->subfieldRelHeight),
+                        $this->imageOptions['rescale'],
+                        $rescaleBlurFactor
+                    );
+                    $coloredImage->setImageBackgroundColor('transparent');
+                }
 
-            // Places the current image on a larger field of black if the final
-            // image is larger than this one
-            $imagickVersion = $coloredImage->getVersion();
+                // Places the current image on a larger field of black if the final
+                // image is larger than this one
+                $imagickVersion = $coloredImage->getVersion();
 
-            if ( $imagickVersion['versionNumber'] > IMAGE_MAGICK_662_VERSION_NUM) {
-				// ImageMagick 6.6.2-6 and higher
-                // Problematic change occurred in revision 6.6.4-2
-                // See: http://www.imagemagick.org/script/changelog.php
-                $coloredImage->extentImage(
-                    $this->padding['width'], $this->padding['height'],
-                    $this->padding['offsetX'], $this->padding['offsetY']
-                );
-            }
-            else {
-                // Imagick 3.0 and lower
-                $coloredImage->extentImage(
-                     $this->padding['width'],    $this->padding['height'],
-                    -$this->padding['offsetX'], -$this->padding['offsetY']
-                );
+                if ( $imagickVersion['versionNumber'] > IMAGE_MAGICK_662_VERSION_NUM) {
+                    // ImageMagick 6.6.2-6 and higher
+                    // Problematic change occurred in revision 6.6.4-2
+                    // See: http://www.imagemagick.org/script/changelog.php
+                    $coloredImage->extentImage(
+                        $this->padding['width'], $this->padding['height'],
+                        $this->padding['offsetX'], $this->padding['offsetY']
+                    );
+                }
+                else {
+                    // Imagick 3.0 and lower
+                    $coloredImage->extentImage(
+                         $this->padding['width'],    $this->padding['height'],
+                        -$this->padding['offsetX'], -$this->padding['offsetY']
+                    );
+                }
             }
 
             $this->image = $coloredImage;

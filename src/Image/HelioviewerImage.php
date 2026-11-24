@@ -61,7 +61,9 @@ class Image_HelioviewerImage extends Image_SubFieldImage {
         	'jp2Difference'=> $this->options['jp2Difference'],
         	'jp2DiffPath'  => $this->options['jp2DiffPath'],
         	'jp2DifferenceLabel'  => $this->options['jp2DifferenceLabel'],
-            'followViewport' => $this->options['followViewport']
+            'followViewport' => $this->options['followViewport'],
+            'compositeWCS'      => $options['compositeWCS'] ?? false,
+            'wcsViewportOffset' => $options['wcsViewportOffset'] ?? array(0, 0)
         );
 
         if ($this->options['grayscale']) {

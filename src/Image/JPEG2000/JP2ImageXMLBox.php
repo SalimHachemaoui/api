@@ -625,6 +625,20 @@ class Image_JPEG2000_JP2ImageXMLBox {
         return $layeringOrder;
     }
 
+    /**
+     * Returns true if the header carries enough WCS information
+     * (CDELT + CRPIX, optional CD/PC matrix) to render via the affine path.
+     */
+    public function hasUsableWCS(): bool {
+        try {
+            $this->getImagePlateScales();
+            $this->getRefPixelCoords();
+            return true;
+        } catch (Exception $e) {
+            return false;
+        }
+    }
+
     public function getRotation(): float {
         try {
             $rotation = $this->_getElementValue('CROTA');
