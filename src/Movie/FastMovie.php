@@ -974,7 +974,9 @@ class FastMovie
         $recipe['wcs'] = $wcsHeader->hasUsableWCS();
 
         if ($recipe['wcs']) {
-            $decoded = $this->decodeWcsLayer($jp2, $wcsHeader, $recipe, (int) $layer['opacity'], $difference);
+            $decoded = $this->decodeWcsLayer($jp2, $wcsHeader, $recipe, (int) $layer['opacity'], $difference,
+                $this->followViewport ? $originalOffsetX : $offsetX,
+                $this->followViewport ? $originalOffsetY : $offsetY);
         } else {
             $decoded = $this->decodeLayer($jp2, $recipe, $offsetX, $offsetY,
                 $this->followViewport ? $originalOffsetX : $offsetX,
@@ -1029,6 +1031,7 @@ class FastMovie
             case 'HMI':
             case 'MDI':
             case 'GONG':
+            case 'CCOR':
                 break;                                  // grayscale, no colour table
             case 'EIT':
                 $table = $tables . 'SOHO_EIT_' . ($names[3] ?? $names[2]) . '.png';
@@ -1223,7 +1226,7 @@ class FastMovie
      * cross the viewport even when its unrotated rectangle does not. No
      * occulter mask.
      */
-    private function decodeWcsLayer(array $jp2, \Image_JPEG2000_JP2ImageXMLBox $header, array $recipe, int $opacity, ?string $difference): Imagick
+    private function decodeWcsLayer(array $jp2, \Image_JPEG2000_JP2ImageXMLBox $header, array $recipe, int $opacity, ?string $difference, $maskOffsetX = 0, $maskOffsetY = 0): Imagick
     {
         $cd     = $header->getCDMatrix();
         $sun    = $header->getRefPixelCoords();   // CRPIX - inverse(CD) * CRVAL
@@ -1265,7 +1268,15 @@ class FastMovie
         // Grayscale pixels must take RGB layers below without pulling their
         // colour tables to grayscale when composited.
         $image->transformImageColorspace(Imagick::COLORSPACE_SRGB);
-        $this->setOpacity($image, $opacity);
+
+        // Transparency: a coronagraph is cut out with its occulter mask,
+        // everything else just gets its opacity. The mask is applied here,
+        // in JP2 pixel space, before the affine places the image on the canvas.
+        if ($recipe['mask'] !== null) {
+            $this->clipOcculter($image, $recipe['mask'], $jp2, $region, 0, $maskOffsetX, $maskOffsetY, $jp2['width'], $jp2['height'], $opacity);
+        } else {
+            $this->setOpacity($image, $opacity);
+        }
         $image->setImageVirtualPixelMethod(Imagick::VIRTUALPIXELMETHOD_TRANSPARENT);
         $image->setImageBackgroundColor('transparent');
         $image->setImagePage(0, 0, 0, 0);
